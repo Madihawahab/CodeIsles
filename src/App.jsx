@@ -1,3 +1,20 @@
+import {
+  doc,
+  getDoc,
+  setDoc,
+  serverTimestamp,
+  collection,
+  addDoc,
+  query,
+  where,
+  getDocs,
+  deleteDoc,
+  onSnapshot,
+  updateDoc
+} from "firebase/firestore";
+import Editor from "@monaco-editor/react";
+import { signInWithPopup, onAuthStateChanged } from "firebase/auth";
+import { auth, provider, db } from "./firebase";
 import { useEffect, useState } from "react";
 import clouds from "./assets/clouds.png";
 import { motion } from "framer-motion";
@@ -116,6 +133,92 @@ function FloatingIsland({
   );
 }
 
+function BattleScreen({ battleId, battleData }) {
+  const [timeLeft, setTimeLeft] = useState(900);
+  const user = auth.currentUser;
+  const [code, setCode] = useState(`// Write your solution here
+
+function solve() {
+  
+}
+`);
+<Editor
+  height="500px"
+  defaultLanguage="javascript"
+  theme="vs-dark"
+  value={code}
+  onChange={(value) => setCode(value)}
+  options={{
+    fontSize: 16,
+    minimap: { enabled: false },
+    wordWrap: "on",
+    automaticLayout: true,
+  }}
+/>
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setTimeLeft((prev) => prev - 1);
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const submitSolution = async () => {
+  if (battleData.winner) return;
+
+  console.log("Submitted code:", code);
+
+  await updateDoc(doc(db, "battles", battleId), {
+    winner: user.uid
+  });
+};
+
+
+  return (
+    <div style={{ padding: "40px", color: "white", background: "#1b3f73", height: "100vh" }}>
+      <h2>⚔️ Code Battle</h2>
+      <h3>⏳ Time Left: {timeLeft}s</h3>
+
+      {battleData.winner && (
+        <h2>
+          {battleData.winner === user.uid ? "🏆 You Won!" : "❌ Opponent Won!"}
+        </h2>
+      )}
+
+      {!battleData.winner && (
+        <>
+          <Editor
+  height="500px"
+  defaultLanguage="javascript"
+  theme="vs-dark"
+  defaultValue={`// Write your solution here
+
+function solve() {
+  
+}
+`}
+  options={{
+    fontSize: 16,
+    minimap: { enabled: false },
+    wordWrap: "on",
+    scrollBeyondLastLine: false,
+    automaticLayout: true,
+    formatOnPaste: true,
+    formatOnType: true,
+  }}
+/>
+
+          <button onClick={submitSolution}>Submit</button>
+        </>
+      )}
+
+      {battleData.winner && battleData.winner !== user.uid && (
+        <p>⚡ Opponent submitted first</p>
+      )}
+    </div>
+  );
+}
+
 function MovingCloud({ top, size, duration, opacity, blur = 0, z = 0 }) {
   return (
     <motion.img
@@ -144,12 +247,75 @@ function AlgorithmScreen({ onBack }) {
   const [selectedTopic, setSelectedTopic] = useState(null);
   const [understanding, setUnderstanding] = useState(null);
   const [difficulty, setDifficulty] = useState(null);
+  const [battleId, setBattleId] = useState(null);
+  const [battleData, setBattleData] = useState(null);
 
-  const resetDSA = () => {
+  const findMatch = async () => {
+    const user = auth.currentUser;
+
+    const queueRef = collection(db, "matchmakingQueue");
+
+    const q = query(
+      queueRef,
+      where("topic", "==", selectedTopic),
+      where("difficulty", "==", difficulty)
+    );
+
+    const snapshot = await getDocs(q);
+
+    if (!snapshot.empty) {
+      const opponentDoc = snapshot.docs[0];
+
+      const battleRef = await addDoc(collection(db, "battles"), {
+        players: [user.uid, opponentDoc.data().uid],
+        topic: selectedTopic,
+        difficulty,
+        startTime: serverTimestamp(),
+        status: "active",
+        winner: null
+      });
+
+      await deleteDoc(doc(db, "matchmakingQueue", opponentDoc.id));
+
+      setBattleId(battleRef.id);
+    } else {
+      await addDoc(queueRef, {
+        uid: user.uid,
+        topic: selectedTopic,
+        difficulty,
+        createdAt: serverTimestamp()
+      });
+    }
+  };
+
+  useEffect(() => {
+    if (!auth.currentUser) return;
+
+    const q = query(
+      collection(db, "battles"),
+      where("players", "array-contains", auth.currentUser.uid),
+      where("status", "==", "active")
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      snapshot.forEach((docSnap) => {
+        setBattleId(docSnap.id);
+        setBattleData(docSnap.data());
+      });
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  if (battleId && battleData) {
+    return <BattleScreen battleId={battleId} battleData={battleData} />;
+  }
+const resetDSA = () => {
     setSelectedTopic(null);
     setUnderstanding(null);
     setDifficulty(null);
   };
+
 
   return (
     <div
@@ -328,6 +494,7 @@ function AlgorithmScreen({ onBack }) {
               </h3>
 
               <motion.button
+              onClick={findMatch}
                 whileHover={{ scale: 1.1 }}
                 style={{
                   marginTop: "30px",
@@ -340,7 +507,7 @@ function AlgorithmScreen({ onBack }) {
                   fontSize: "18px",
                 }}
               >
-                🚀 Start Practice
+                🚀 Find the opponent for the battle
               </motion.button>
             </div>
           )}
@@ -348,14 +515,69 @@ function AlgorithmScreen({ onBack }) {
       )}
     </div>
   );
+  
 }
 
 
-
 function App() {
+  const [user, setUser] = useState(null);
   const [mouse, setMouse] = useState({ x: 0, y: 0 });
   const [screen, setScreen] = useState("world");
 
+  // 🔐 Auth Listener
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      setUser(currentUser);
+
+      // If user logs in first time → create profile in Firestore
+      if (currentUser) {
+        const userRef = doc(db, "users", currentUser.uid);
+        const userSnap = await getDoc(userRef);
+
+        if (!userSnap.exists()) {
+          await setDoc(userRef, {
+            uid: currentUser.uid,
+            name: currentUser.displayName,
+            email: currentUser.email,
+            rating: 1200,
+            createdAt: serverTimestamp(),
+          });
+        }
+      }
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  // 🛑 If not logged in → show login screen
+  if (!user) {
+    return (
+      <div
+        style={{
+          height: "100vh",
+          display: "flex",
+          justifyContent: "center",
+          alignItems: "center",
+          background: "linear-gradient(135deg, #2f80c9, #1b3f73)",
+        }}
+      >
+        <button
+          onClick={() => signInWithPopup(auth, provider)}
+          style={{
+            padding: "15px 40px",
+            fontSize: "18px",
+            borderRadius: "12px",
+            border: "none",
+            cursor: "pointer",
+          }}
+        >
+          🔐 Sign in with Google
+        </button>
+      </div>
+    );
+  }
+
+  // 🔁 Algorithm Screen
   if (screen === "algorithm") {
     return <AlgorithmScreen onBack={() => setScreen("world")} />;
   }
@@ -379,6 +601,23 @@ function App() {
         overflow: "hidden",
       }}
     >
+      {/* Logout Button */}
+      <button
+        onClick={() => auth.signOut()}
+        style={{
+          position: "absolute",
+          top: "20px",
+          right: "20px",
+          padding: "8px 20px",
+          borderRadius: "10px",
+          border: "none",
+          cursor: "pointer",
+          zIndex: 100,
+        }}
+      >
+        Logout
+      </button>
+
       <MovingCloud top="0%" size="1000px" duration={150} opacity={0.35} blur={8} z={0} />
       <MovingCloud top="0%" size="900px" duration={120} opacity={0.45} blur={6} z={0} />
       <MovingCloud top="30%" size="800px" duration={90} opacity={0.55} blur={3} z={1} />
@@ -446,5 +685,6 @@ function App() {
     </div>
   );
 }
+
 
 export default App;
